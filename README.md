@@ -17,18 +17,17 @@
 ## Cấu trúc
 
 ```
+├── index.html             # Frontend chính
+├── app.js                 # Logic UI, ARIMA worker, AI chat
+├── arima.worker.js        # ARIMA chạy trong Web Worker
+├── arimax.worker.js       # ARIMAX chạy trong Web Worker
+├── llm.worker.js          # LLM inference (transformers.js + WebGPU)
+├── style.css
+├── native.wasm            # WASM binary
+├── native-async.js        # WASM loader
+├── stocks.db              # SQLite database
 ├── vietstock_scraper.py   # Scraper lấy dữ liệu từ CafeF API
-├── scraper_cli.py         # CLI để chạy scraper
-├── stocks.db              # SQLite database (root)
-│
-└── web-static/            # Frontend thuần HTML/JS/CSS (không cần build)
-    ├── index.html
-    ├── app.js             # Logic chính: UI, ARIMA worker, AI chat
-    ├── arima.worker.js    # ARIMA chạy trong Web Worker
-    ├── arimax.worker.js   # ARIMAX chạy trong Web Worker
-    ├── llm.worker.js      # LLM inference (transformers.js + WebGPU)
-    ├── style.css
-    └── stocks.db          # SQLite database (được serve tĩnh)
+└── scraper_cli.py         # CLI để chạy scraper
 ```
 
 ---
@@ -57,18 +56,11 @@ python scraper_cli.py --start-date 01/01/2023
 python scraper_cli.py --symbol FPT --start-date 01/01/2024
 ```
 
-### 3. Copy DB vào web-static
-
-```bash
-cp stocks.db web-static/stocks.db
-```
-
-### 4. Serve frontend
+### 3. Serve frontend
 
 Cần serve qua HTTP (không mở file:// trực tiếp vì WASM và Worker yêu cầu HTTP):
 
 ```bash
-cd web-static
 python3 -m http.server 8080
 ```
 
