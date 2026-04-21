@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ARIMA Stock Forecast</title>
+  <script src="https://cdn.jsdelivr.net/npm/sql.js@1.12.0/dist/sql-wasm.js"></script>
+  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="container">
+    <h1>📈 ARIMA Stock Forecast</h1>
+    <p class="subtitle">Dự báo giá cổ phiếu Việt Nam bằng mô hình ARIMA. Chọn tối đa 10 mã, sau đó nhấn <strong>Chạy phân tích</strong>.</p>
+
+    <!-- Dòng 1: Mã cổ phiếu -->
+    <div class="row">
+      <div class="field" style="flex:1">
+        <label>Mã cổ phiếu (tối đa 10)</label>
+        <div id="symbolTags" class="tag-input">
+          <input type="text" id="symbolSearch" placeholder="Nhập mã rồi Enter..." autocomplete="off" />
+          <div id="symbolDropdown" class="dropdown hidden"></div>
+        </div>
+      </div>
+      <div class="field" style="flex:0 0 auto">
+        <label>&nbsp;</label>
+        <button id="reloadDbBtn" class="btn-secondary" title="Tải lại database từ server">🔄 Reload DB</button>
+      </div>
+    </div>
+
+    <!-- Dòng 2: Khoảng thời gian + Số phiên dự báo + Ngưỡng giá -->
+    <div class="row">
+      <div class="field">
+        <label>Khoảng thời gian</label>
+        <select id="period">
+          <option value="7">1 tuần</option>
+          <option value="30">1 tháng</option>
+          <option value="90">3 tháng</option>
+          <option value="180">6 tháng</option>
+          <option value="365" selected>1 năm</option>
+          <option value="730">2 năm</option>
+          <option value="1095">3 năm</option>
+          <option value="1825">5 năm</option>
+          <option value="0">Toàn bộ</option>
+        </select>
+      </div>
+      <div class="field">
+        <label>Số phiên dự báo</label>
+        <select id="forecastSteps">
+          <option value="5">5</option>
+          <option value="10" selected>10</option>
+          <option value="15">15</option>
+          <option value="20">20</option>
+          <option value="30">30</option>
+        </select>
+      </div>
+    </div>
+
+    <!-- Dòng 2b: Ngưỡng thay đổi giá -->
+    <div class="row">
+      <div class="field price-limit-field">
+        <label>Giới hạn giảm tối đa / phiên</label>
+        <div class="pct-input-wrap">
+          <input type="number" id="minPct" value="-7" min="-20" max="0" step="0.5" />
+          <span class="pct-unit">%</span>
+        </div>
+      </div>
+      <div class="field price-limit-field">
+        <label>Giới hạn tăng tối đa / phiên</label>
+        <div class="pct-input-wrap">
+          <input type="number" id="maxPct" value="7" min="0" max="20" step="0.5" />
+          <span class="pct-unit">%</span>
+        </div>
+      </div>
+      <div class="field" style="flex:2;align-self:flex-end">
+        <p class="limit-hint">Dự báo mỗi phiên sẽ bị giới hạn trong khoảng <strong id="limitLabel">−7% ~ +7%</strong> so với giá phiên trước. Phù hợp với biên độ sàn HOSE/HNX.</p>
+      </div>
+    </div>
+
+    <!-- Dòng 3: Checkbox tự động -->
+    <div class="row">
+      <label class="checkbox-label">
+        <input type="checkbox" id="autoParams" checked />
+        Tự động tìm tham số tối ưu (Grid Search AIC)
+      </label>
+    </div>
+
+    <!-- Dòng 4: Tham số p/d/q -->
+    <div class="row" id="manualParams" style="opacity:0.4;pointer-events:none">
+      <div class="field slider-field">
+        <label>p (AR): <span id="pVal">1</span></label>
+        <input type="range" id="pSlider" min="0" max="5" value="1" step="1" />
+      </div>
+      <div class="field slider-field">
+        <label>d (I): <span id="dVal">1</span></label>
+        <input type="range" id="dSlider" min="0" max="2" value="1" step="1" />
+      </div>
+      <div class="field slider-field">
+        <label>q (MA): <span id="qVal">1</span></label>
+        <input type="range" id="qSlider" min="0" max="5" value="1" step="1" />
+      </div>
+    </div>
+
+    <!-- Dòng 5: Nút phân tích -->
+    <div class="row">
+      <button id="runBtn" class="btn-primary" disabled>🚀 Chạy phân tích</button>
+      <span id="statusMsg" class="status-msg"></span>
+    </div>
+
+    <!-- Dòng 6: Giải thích -->
+    <div class="row accordion-row">
+      <details class="accordion">
+        <summary>📖 Giải thích tham số</summary>
+        <div class="accordion-body">
+          <p><strong>Khoảng thời gian</strong> — Số ngày lịch sử dùng để huấn luyện.</p>
+          <p><strong>Số phiên dự báo</strong> — Nên giữ ở mức ngắn (5–15 phiên) để kết quả có ý nghĩa.</p>
+          <table>
+            <tr><th>Tham số</th><th>Tên</th><th>Ý nghĩa</th></tr>
+            <tr><td><strong>p</strong></td><td>AR</td><td>Số giá trị quá khứ dùng để dự báo</td></tr>
+            <tr><td><strong>d</strong></td><td>I</td><td>Số lần lấy sai phân (thường d=1 cho giá CP)</td></tr>
+            <tr><td><strong>q</strong></td><td>MA</td><td>Số sai số dự báo quá khứ đưa vào mô hình</td></tr>
+          </table>
+          <p><em>Tự động tìm tham số: Grid Search tối thiểu hóa AIC.</em></p>
+        </div>
+      </details>
+      <details class="accordion">
+        <summary>📊 Giải thích kết quả &amp; metrics</summary>
+        <div class="accordion-body">
+          <p><strong>AIC</strong> — Càng thấp càng tốt. Dùng để so sánh các mô hình.</p>
+          <table>
+            <tr><th>Metric</th><th>Ý nghĩa</th></tr>
+            <tr><td><strong>MAE</strong></td><td>Sai số tuyệt đối trung bình</td></tr>
+            <tr><td><strong>RMSE</strong></td><td>Phạt nặng hơn các sai số lớn</td></tr>
+            <tr><td><strong>MAPE</strong></td><td>Sai số theo %; &lt;5%: rất tốt · 5–10%: tốt · &gt;20%: kém</td></tr>
+          </table>
+          <p><strong>95% CI</strong> — Khoảng tin cậy 95% của dự báo.</p>
+          <p><strong>Residuals</strong> — Mô hình tốt khi phân bố ngẫu nhiên quanh 0.</p>
+        </div>
+      </details>
+    </div>
+
+    <!-- Dòng 7: Tab kết quả -->
+    <div id="resultsSection" class="hidden">
+      <div class="tab-bar" id="tabBar"></div>
+      <div id="tabPanels"></div>
+    </div>
+
+    <div id="loadingOverlay" class="loading-overlay hidden">
+      <div class="spinner"></div>
+      <div id="loadingMsg">Đang xử lý...</div>
+    </div>
+
+    <!-- ── ARIMAX Section ─────────────────────────────────────────────────── -->
+    <hr class="section-divider" />
+    <h2 class="section-title">🔬 ARIMAX — ARIMA with eXogenous Features</h2>
+    <p class="subtitle">
+      Sử dụng features tính từ OHLCV: <strong>Log Return</strong>, <strong>H-L Range</strong>,
+      <strong>Volume/MA5</strong>, <strong>RSI 14</strong>, <strong>MACD Histogram</strong>,
+      <strong>VAR(1) prediction</strong> (open, high, low, volume → close proxy).
+      Cùng mã &amp; khoảng thời gian đã chọn ở trên.
+    </p>
+
+    <!-- Tham số p/d/q riêng cho ARIMAX -->
+    <div class="row">
+      <label class="checkbox-label">
+        <input type="checkbox" id="arimaxAutoParams" checked />
+        Tự động tìm tham số tối ưu (Grid Search AIC trên residuals)
+      </label>
+    </div>
+    <div class="row" id="arimaxManualParams" style="opacity:0.4;pointer-events:none">
+      <div class="field slider-field">
+        <label>p (AR): <span id="axPVal">1</span></label>
+        <input type="range" id="axPSlider" min="0" max="5" value="1" step="1" />
+      </div>
+      <div class="field slider-field">
+        <label>d (I): <span id="axDVal">1</span></label>
+        <input type="range" id="axDSlider" min="0" max="2" value="1" step="1" />
+      </div>
+      <div class="field slider-field">
+        <label>q (MA): <span id="axQVal">1</span></label>
+        <input type="range" id="axQSlider" min="0" max="5" value="1" step="1" />
+      </div>
+    </div>
+
+    <div class="row">
+      <button id="arimaxRunBtn" class="btn-arimax" disabled>🔬 Chạy ARIMAX</button>
+      <span id="arimaxStatusMsg" class="status-msg"></span>
+    </div>
+
+    <!-- Accordion giải thích features -->
+    <div class="row accordion-row">
+      <details class="accordion">
+        <summary>🔍 Giải thích features OHLCV + VAR</summary>
+        <div class="accordion-body">
+          <table>
+            <tr><th>Feature</th><th>Công thức</th><th>Ý nghĩa</th></tr>
+            <tr><td><strong>returns</strong></td><td>ln(close_t / close_{t-1})</td><td>Log return — xu hướng giá</td></tr>
+            <tr><td><strong>hlRange</strong></td><td>(high − low) / close</td><td>Biên độ giá trong phiên</td></tr>
+            <tr><td><strong>volumeMa5</strong></td><td>volume / MA5(volume)</td><td>Áp lực khối lượng so với trung bình</td></tr>
+            <tr><td><strong>rsi14</strong></td><td>RSI(14) / 100</td><td>Động lượng giá (0–1)</td></tr>
+            <tr><td><strong>macdHist</strong></td><td>(MACD − Signal) / close</td><td>Tín hiệu xu hướng ngắn hạn</td></tr>
+            <tr><td><strong>varPred</strong></td><td>VAR(1)[open,high,low,vol] → proxy / close − 1</td><td>Dự báo 1 bước từ Vector Autoregression</td></tr>
+          </table>
+          <p style="margin-top:8px"><em>ARIMAX = OLS(close ~ features) + ARIMA(p,d,q) trên phần dư (residuals).</em></p>
+        </div>
+      </details>
+    </div>
+
+    <!-- Kết quả ARIMAX -->
+    <div id="arimaxResultsSection" class="hidden">
+      <div class="tab-bar" id="arimaxTabBar"></div>
+      <div id="arimaxTabPanels"></div>
+    </div>
+
+    <div id="arimaxLoadingOverlay" class="loading-overlay hidden">
+      <div class="spinner" style="border-top-color:#e63946"></div>
+      <div id="arimaxLoadingMsg">Đang xử lý ARIMAX...</div>
+    </div>
+
+    <!-- ── Hidden forecast context (populated by JS after each run) ────────── -->
+    <textarea id="forecastContext" style="display:none" aria-hidden="true"></textarea>
+
+  </div><!-- /.container -->
+
+  <!-- ── AI Chat Bubble (fixed, bottom-right) ─────────────────────────────── -->
+  <button id="chatBubbleBtn" class="chat-bubble-btn" title="Hỏi đáp AI">
+    🤖
+    <span id="chatBubbleBadge" class="chat-bubble-badge hidden">!</span>
+  </button>
+
+  <div id="chatPanel" class="chat-panel hidden">
+    <!-- Header -->
+    <div class="chat-panel-header">
+      <span class="chat-panel-title">🤖 Hỏi đáp AI</span>
+      <div class="chat-panel-header-actions">
+        <button id="llmClearBtn" class="chat-icon-btn" title="Xóa lịch sử">🗑</button>
+        <button id="chatCloseBtn" class="chat-icon-btn" title="Đóng">✕</button>
+      </div>
+    </div>
+
+    <!-- Model selector + load -->
+    <div class="chat-model-row">
+      <span class="chat-model-label">Qwen3-0.6B</span>
+      <label class="think-toggle" title="Bật chế độ suy luận (chậm hơn nhưng chính xác hơn)">
+        <input type="checkbox" id="llmThinkChk" />
+        <span>💭 Think</span>
+      </label>
+      <button id="llmLoadBtn" class="btn-secondary chat-load-btn">⬇️ Tải</button>
+    </div>
+
+    <!-- Progress -->
+    <div id="llmProgressWrap" class="llm-progress-wrap hidden">
+      <div id="llmProgressBar" class="llm-progress-bar"></div>
+    </div>
+    <div id="llmStatusMsg" class="chat-status">Chưa tải model.</div>
+
+    <!-- Messages -->
+    <div id="llmChatBox" class="llm-chat-box">
+      <div id="llmMessages" class="llm-messages">
+        <div class="llm-msg llm-msg--system">Tải model và chạy phân tích để bắt đầu.</div>
+      </div>
+    </div>
+
+    <!-- Input -->
+    <div class="llm-input-row">
+      <textarea id="llmInput" class="llm-input"
+        placeholder="Hỏi về dự báo..." rows="2" disabled></textarea>
+      <div class="llm-input-btns">
+        <button id="llmSendBtn" class="btn-primary" disabled>↵</button>
+        <button id="llmAbortBtn" class="btn-secondary hidden">⏹</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
