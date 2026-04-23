@@ -1140,7 +1140,7 @@ let llmWorker      = null;
 let llmModelLoaded = false;
 let llmGenerating  = false;
 let llmChatHistory = [];   // { role, content }[]
-const LLM_HISTORY_LIMIT = 1;
+const LLM_HISTORY_LIMIT = 5;
 
 // Lưu kết quả forecast theo symbol: { [symbol]: { arima?, arimax?, updatedAt } }
 const forecastStore = {};

@@ -107,10 +107,10 @@ async function generate({ messages, enableThinking = true }) {
   let tps;
 
   // ── Extract messages ──
-  const systemMsg = messages.find(m => m.role === "system");
-  const userMsg   = messages.filter(m => m.role === "user").pop();
+  const systemMsg   = messages.find(m => m.role === "system");
+  const turnMsgs    = messages.filter(m => m.role !== "system"); // user/assistant pairs
   const systemContent = systemMsg?.content || "";
-  const userContent   = userMsg?.content || "";
+  const userContent   = turnMsgs.filter(m => m.role === "user").pop()?.content || "";
 
   // ── Check if system prompt changed → invalidate KV ──
   const systemChanged = lastSystemPrompt !== "" && systemContent !== lastSystemPrompt;
@@ -125,8 +125,8 @@ async function generate({ messages, enableThinking = true }) {
   let fullPrompt;
 
   if (canReuse) {
-    // Continuation turn: append new user turn to existing history
-    // System prompt is already baked into KV cache from turn 1
+    // Continuation turn: append only the latest user turn to existing history
+    // System prompt + prior turns are already baked into KV cache
     const newTurn =
       `<|im_start|>user\n${userContent}<|im_end|>\n` +
       (enableThinking
@@ -135,14 +135,33 @@ async function generate({ messages, enableThinking = true }) {
 
     fullPrompt = promptHistory + "\n" + newTurn;
   } else {
-    // Fresh start: system + user + assistant prompt
-    fullPrompt =
-      (systemContent ? `<|im_start|>system\n${systemContent}<|im_end|>\n` : "") +
-      `<|im_start|>user\n${userContent}<|im_end|>\n` +
-      (enableThinking
+    // Fresh start: build full prompt with system + all history turns
+    let parts = [];
+
+    if (systemContent) {
+      parts.push(`<|im_start|>system\n${systemContent}<|im_end|>`);
+    }
+
+    // Include all conversation turns from history (user/assistant pairs)
+    for (const msg of turnMsgs) {
+      if (msg.role === "user") {
+        parts.push(`<|im_start|>user\n${msg.content}<|im_end|>`);
+      } else if (msg.role === "assistant") {
+        parts.push(`<|im_start|>assistant\n${msg.content}<|im_end|>`);
+      }
+    }
+
+    // If the last turn was user, add assistant generation prompt
+    const lastRole = turnMsgs[turnMsgs.length - 1]?.role;
+    if (lastRole === "user" || !lastRole) {
+      // Remove the trailing <|im_end|> from last user msg — we already added it
+      // Now add assistant prompt with thinking control
+      parts.push(enableThinking
         ? "<|im_start|>assistant\n<think>\n"
         : "<|im_start|>assistant\n<think>\n\n</think>\n\n");
+    }
 
+    fullPrompt = parts.join("\n");
     lastSystemPrompt = systemContent;
   }
 
