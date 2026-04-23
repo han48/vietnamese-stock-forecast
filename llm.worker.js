@@ -3,7 +3,8 @@
  * Model: onnx-community/Qwen3-0.6B-ONNX
  * Worker type: module  →  new Worker("llm.worker.js", { type: "module" })
  *
- * v2: Upgraded to transformers v4, direct model class, KV cache for multi-turn.
+ * v4: Always inject system prompt. KV cache reuse only when system prompt
+ *     is unchanged between turns. Manual prompt building for KV compatibility.
  */
 
 import {
@@ -21,8 +22,9 @@ let model     = null;
 const stopping = new InterruptableStoppingCriteria();
 
 // KV cache state
-let pastKeyValues = null;   // cached KV from previous generation
-let promptHistory = "";     // raw prompt text built up across turns
+let pastKeyValues    = null;
+let promptHistory    = "";   // full decoded text from all prior turns
+let lastSystemPrompt = "";   // detect system prompt changes → invalidate KV
 
 function errMsg(e) {
   if (!e) return "Unknown error";
@@ -38,7 +40,8 @@ function disposePastKeyValues() {
     }
     pastKeyValues = null;
   }
-  promptHistory = "";
+  promptHistory    = "";
+  lastSystemPrompt = "";
 }
 
 // ── Cache check ───────────────────────────────────────────────────────────────
@@ -81,7 +84,17 @@ async function load() {
   self.postMessage({ status: "ready" });
 }
 
-// ── Generate (with KV cache) ─────────────────────────────────────────────────
+// ── Generate ─────────────────────────────────────────────────────────────────
+//
+// Each call receives the full messages array from app.js:
+//   [{ role:"system", content:"..." }, { role:"user", content:"..." }]
+//
+// Strategy:
+//   - System prompt contains dynamic data (forecast, DB) that changes per turn.
+//   - If system prompt is SAME as last turn → reuse KV cache (fast continuation).
+//   - If system prompt CHANGED → dispose KV, rebuild from scratch.
+//   - Prompt is always built manually with special tokens for KV compatibility.
+//
 async function generate({ messages, enableThinking = true }) {
   if (!model || !tokenizer) {
     console.error("[LLM] not ready");
@@ -93,73 +106,87 @@ async function generate({ messages, enableThinking = true }) {
   let startTime;
   let tps;
 
-  // Build the current turn's prompt using chat template
-  const turnPrompt = tokenizer.apply_chat_template(messages, {
-    tokenize: false,
-    add_generation_prompt: true,
-    enable_thinking: enableThinking,
-  });
+  // ── Extract messages ──
+  const systemMsg = messages.find(m => m.role === "system");
+  const userMsg   = messages.filter(m => m.role === "user").pop();
+  const systemContent = systemMsg?.content || "";
+  const userContent   = userMsg?.content || "";
 
-  // Determine if we can reuse KV cache
-  const isFirstTurn = promptHistory === "";
-  let fullPrompt;
-  let inputs;
-
-  if (!isFirstTurn && pastKeyValues && turnPrompt.startsWith(promptHistory)) {
-    // Continuation: only encode the new part, reuse past KV
-    // This is faster because the model doesn't re-process the entire history
-    fullPrompt = turnPrompt;
-    inputs = tokenizer(fullPrompt);
-  } else {
-    // First turn or context changed (system prompt changed): full encode
+  // ── Check if system prompt changed → invalidate KV ──
+  const systemChanged = lastSystemPrompt !== "" && systemContent !== lastSystemPrompt;
+  if (systemChanged) {
+    console.log("[LLM] system prompt changed — disposing KV cache");
     disposePastKeyValues();
-    fullPrompt = turnPrompt;
-    inputs = tokenizer(fullPrompt);
+  }
+
+  const canReuse = !systemChanged && pastKeyValues && promptHistory !== "";
+
+  // ── Build prompt ──
+  let fullPrompt;
+
+  if (canReuse) {
+    // Continuation turn: append new user turn to existing history
+    // System prompt is already baked into KV cache from turn 1
+    const newTurn =
+      `<|im_start|>user\n${userContent}<|im_end|>\n` +
+      (enableThinking
+        ? "<|im_start|>assistant\n<think>\n"
+        : "<|im_start|>assistant\n<think>\n\n</think>\n\n");
+
+    fullPrompt = promptHistory + "\n" + newTurn;
+  } else {
+    // Fresh start: system + user + assistant prompt
+    fullPrompt =
+      (systemContent ? `<|im_start|>system\n${systemContent}<|im_end|>\n` : "") +
+      `<|im_start|>user\n${userContent}<|im_end|>\n` +
+      (enableThinking
+        ? "<|im_start|>assistant\n<think>\n"
+        : "<|im_start|>assistant\n<think>\n\n</think>\n\n");
+
+    lastSystemPrompt = systemContent;
+  }
+
+  console.log("[LLM] generating — thinking:", enableThinking,
+    "kv_reuse:", canReuse, "prompt_len:", fullPrompt.length);
+
+  const inputs = tokenizer(fullPrompt);
+  const generateArgs = { ...inputs };
+
+  if (canReuse) {
+    generateArgs.past_key_values = pastKeyValues;
   }
 
   const streamer = new TextStreamer(tokenizer, {
     skip_prompt: true,
-    skip_special_tokens: false,   // keep <think> tags so UI can parse them
+    skip_special_tokens: false,
     callback_function(token) {
       startTime ??= performance.now();
       if (numTokens++ > 0) {
         tps = (numTokens / (performance.now() - startTime)) * 1000;
       }
-      // Strip im_start/im_end special tokens, keep <think></think>
       const clean = token.replace(/<\|im_end\|>/g, "").replace(/<\|im_start\|>/g, "");
       if (clean) self.postMessage({ status: "update", output: clean, tps, numTokens });
     },
   });
 
   self.postMessage({ status: "start" });
-  console.log("[LLM] generating, thinking:", enableThinking, "kv_cached:", !!pastKeyValues);
 
-  const generateArgs = {
-    ...inputs,
+  const result = await model.generate({
+    ...generateArgs,
     max_new_tokens: enableThinking ? 1024 : 512,
     do_sample: false,
     streamer,
     stopping_criteria: stopping,
     return_dict_in_generate: true,
-  };
+  });
 
-  // Pass KV cache if available
-  if (pastKeyValues) {
-    generateArgs.past_key_values = pastKeyValues;
-  }
-
-  const result = await model.generate(generateArgs);
-
-  // Update KV cache for next turn
+  // ── Save state for next turn ──
   pastKeyValues = result.past_key_values;
-
-  // Decode the full sequence to maintain prompt history for next turn
-  const fullSequenceText = tokenizer.batch_decode(result.sequences, {
+  promptHistory = tokenizer.batch_decode(result.sequences, {
     skip_special_tokens: false,
   })[0];
-  promptHistory = fullSequenceText;
 
-  console.log("[LLM] generate done, tokens:", numTokens);
+  console.log("[LLM] done, tokens:", numTokens);
   self.postMessage({ status: "complete", numTokens, tps });
 }
 
