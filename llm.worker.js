@@ -1,29 +1,44 @@
 /**
- * llm.worker.js — LLM inference via transformers.js + WebGPU
+ * llm.worker.js — LLM inference via transformers.js v4 + WebGPU
  * Model: onnx-community/Qwen3-0.6B-ONNX
  * Worker type: module  →  new Worker("llm.worker.js", { type: "module" })
+ *
+ * v2: Upgraded to transformers v4, direct model class, KV cache for multi-turn.
  */
 
 import {
-  pipeline,
+  AutoModelForCausalLM,
+  AutoTokenizer,
   TextStreamer,
   InterruptableStoppingCriteria,
-  env,
-} from "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3/dist/transformers.min.js";
+} from "https://cdn.jsdelivr.net/npm/@huggingface/transformers@4.2.0";
 
 const MODEL_ID = "onnx-community/Qwen3-0.6B-ONNX";
 
-env.allowRemoteModels = true;
-env.allowLocalModels  = false;
-
-let generator = null;
+/* ─── State ─── */
+let tokenizer = null;
+let model     = null;
 const stopping = new InterruptableStoppingCriteria();
+
+// KV cache state
+let pastKeyValues = null;   // cached KV from previous generation
+let promptHistory = "";     // raw prompt text built up across turns
 
 function errMsg(e) {
   if (!e) return "Unknown error";
   if (typeof e === "string") return e;
   if (e.message) return e.message;
   try { return JSON.stringify(e); } catch { return String(e); }
+}
+
+function disposePastKeyValues() {
+  if (pastKeyValues) {
+    for (const tensor of Object.values(pastKeyValues)) {
+      tensor.dispose();
+    }
+    pastKeyValues = null;
+  }
+  promptHistory = "";
 }
 
 // ── Cache check ───────────────────────────────────────────────────────────────
@@ -44,7 +59,15 @@ async function load() {
   console.log("[LLM] load() start — device=webgpu, dtype=q4f16");
   self.postMessage({ status: "loading", data: "Đang tải model (WebGPU)…" });
 
-  generator = await pipeline("text-generation", MODEL_ID, {
+  tokenizer = await AutoTokenizer.from_pretrained(MODEL_ID, {
+    progress_callback(info) {
+      if (["initiate", "progress", "done"].includes(info.status)) {
+        self.postMessage(info);
+      }
+    },
+  });
+
+  model = await AutoModelForCausalLM.from_pretrained(MODEL_ID, {
     dtype: "q4f16",
     device: "webgpu",
     progress_callback(info) {
@@ -58,9 +81,9 @@ async function load() {
   self.postMessage({ status: "ready" });
 }
 
-// ── Generate ──────────────────────────────────────────────────────────────────
+// ── Generate (with KV cache) ─────────────────────────────────────────────────
 async function generate({ messages, enableThinking = true }) {
-  if (!generator) {
+  if (!model || !tokenizer) {
     console.error("[LLM] not ready");
     return;
   }
@@ -70,14 +93,31 @@ async function generate({ messages, enableThinking = true }) {
   let startTime;
   let tps;
 
-  // Build prompt manually so we can pass enable_thinking to chat template
-  const prompt = generator.tokenizer.apply_chat_template(messages, {
+  // Build the current turn's prompt using chat template
+  const turnPrompt = tokenizer.apply_chat_template(messages, {
     tokenize: false,
     add_generation_prompt: true,
     enable_thinking: enableThinking,
   });
 
-  const streamer = new TextStreamer(generator.tokenizer, {
+  // Determine if we can reuse KV cache
+  const isFirstTurn = promptHistory === "";
+  let fullPrompt;
+  let inputs;
+
+  if (!isFirstTurn && pastKeyValues && turnPrompt.startsWith(promptHistory)) {
+    // Continuation: only encode the new part, reuse past KV
+    // This is faster because the model doesn't re-process the entire history
+    fullPrompt = turnPrompt;
+    inputs = tokenizer(fullPrompt);
+  } else {
+    // First turn or context changed (system prompt changed): full encode
+    disposePastKeyValues();
+    fullPrompt = turnPrompt;
+    inputs = tokenizer(fullPrompt);
+  }
+
+  const streamer = new TextStreamer(tokenizer, {
     skip_prompt: true,
     skip_special_tokens: false,   // keep <think> tags so UI can parse them
     callback_function(token) {
@@ -92,19 +132,35 @@ async function generate({ messages, enableThinking = true }) {
   });
 
   self.postMessage({ status: "start" });
-  console.log("[LLM] generating, thinking:", enableThinking);
+  console.log("[LLM] generating, thinking:", enableThinking, "kv_cached:", !!pastKeyValues);
 
-  // Pass the rendered string prompt (not messages array) so template is not re-applied
-  await generator(prompt, {
+  const generateArgs = {
+    ...inputs,
     max_new_tokens: enableThinking ? 1024 : 512,
     do_sample: false,
-    return_full_text: false,
     streamer,
     stopping_criteria: stopping,
-  });
+    return_dict_in_generate: true,
+  };
+
+  // Pass KV cache if available
+  if (pastKeyValues) {
+    generateArgs.past_key_values = pastKeyValues;
+  }
+
+  const result = await model.generate(generateArgs);
+
+  // Update KV cache for next turn
+  pastKeyValues = result.past_key_values;
+
+  // Decode the full sequence to maintain prompt history for next turn
+  const fullSequenceText = tokenizer.batch_decode(result.sequences, {
+    skip_special_tokens: false,
+  })[0];
+  promptHistory = fullSequenceText;
 
   console.log("[LLM] generate done, tokens:", numTokens);
-  self.postMessage({ status: "complete" });
+  self.postMessage({ status: "complete", numTokens, tps });
 }
 
 // ── Message handler ───────────────────────────────────────────────────────────
@@ -112,11 +168,13 @@ self.onmessage = async ({ data: { type, data } }) => {
   console.log("[LLM] msg:", type);
   try {
     switch (type) {
-      case "check_cache": await checkCache();    break;
-      case "load":        await load();          break;
-      case "generate":    await generate(data);  break;
-      case "interrupt":   stopping.interrupt();  break;
-      case "reset":       stopping.reset();      break;
+      case "check_cache": await checkCache();       break;
+      case "load":        await load();             break;
+      case "generate":    await generate(data);     break;
+      case "interrupt":   stopping.interrupt();     break;
+      case "reset":       stopping.reset();
+                          disposePastKeyValues();   break;
+      case "reset_kv":    disposePastKeyValues();   break;
     }
   } catch (e) {
     console.error("[LLM] error in", type, e);
