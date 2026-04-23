@@ -169,6 +169,21 @@ h1 { font-size: 1.7rem; margin-bottom: 4px; }
   align-self: center;
 }
 
+.db-meta-info {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 16px;
+  font-size: 0.8rem;
+  color: #666;
+  background: #f0f4f8;
+  border: 1px solid #dde3ea;
+  border-radius: 8px;
+  padding: 8px 14px;
+  margin-top: 2px;
+}
+.db-meta-info.hidden { display: none; }
+.db-meta-info strong { color: #333; }
+
 /* ── Accordion ── */
 .accordion-row { align-items: flex-start; }
 

@@ -193,9 +193,35 @@ function openDb(uint8arr) {
     setStatus(`✅ DB: ${allSymbols.length} mã  |  ${ready}`);
     updateRunBtn();
     updateArimaxRunBtn();
+    renderDbMeta();
   } catch (e) {
     setStatus("❌ Lỗi mở DB: " + e.message);
   }
+}
+
+function renderDbMeta() {
+  const el = document.getElementById("dbMetaInfo");
+  if (!db || !el) return;
+  try {
+    const getMeta = (key) => {
+      const r = db.exec("SELECT value FROM meta WHERE key = ?", [key]);
+      return r.length ? r[0].values[0][0] : null;
+    };
+    const countRes = db.exec("SELECT COUNT(*) FROM stock_prices");
+    const rangeRes = db.exec("SELECT MIN(date), MAX(date) FROM stock_prices");
+    const totalRows   = countRes.length ? countRes[0].values[0][0] : 0;
+    const minDate     = rangeRes.length ? rangeRes[0].values[0][0] : "?";
+    const maxDate     = rangeRes.length ? rangeRes[0].values[0][1] : "?";
+    const lastSymLoad = getMeta("last_symbol_load");
+    const lastPxLoad  = getMeta("last_price_load");
+
+    el.innerHTML =
+      `<span>📦 <strong>${allSymbols.length}</strong> mã · <strong>${totalRows.toLocaleString("vi-VN")}</strong> bản ghi</span>` +
+      `<span>📅 ${minDate} → ${maxDate}</span>` +
+      (lastPxLoad  ? `<span>🔄 Giá: ${lastPxLoad}</span>` : "") +
+      (lastSymLoad ? `<span>🏷️ Mã: ${lastSymLoad}</span>` : "");
+    el.classList.remove("hidden");
+  } catch { /* ignore */ }
 }
 
 // ── Worker messaging ──────────────────────────────────────────────────────────
