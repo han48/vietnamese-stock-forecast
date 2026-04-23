@@ -2,6 +2,8 @@
 
 Ứng dụng dự báo giá cổ phiếu Việt Nam chạy hoàn toàn trên trình duyệt, không cần backend. Dữ liệu lịch sử được scrape từ CafeF và lưu vào SQLite. Mô hình ARIMA/ARIMAX chạy trong Web Worker. Tích hợp AI chat (Qwen3-0.6B, WebGPU) để hỏi đáp về kết quả phân tích.
 
+Oneline demo: [huggingface](https://huggingface.co/spaces/mr4/vietnamese-stock-forecast)
+
 ---
 
 ## Tính năng
